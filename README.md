@@ -40,7 +40,9 @@ Without it, CarbonCC still copies the item; you just press ⌘V yourself.
 ## Features
 
 - **History in the menu bar.** Everything you copy, grouped 1–10, 11–20, … up to 1,000 items.
-- **Search panel (⇧⌘V).** Opens at your cursor, filters as you type, with a live preview of the full text, image or files.
+- **Search panel (⇧⌘V).** Opens in the middle of your screen, filters as you type, with a live preview of the full text, image or files.
+- **Categories.** Tabs for All, Pinned, Text, Images, Links, Code, JSON, Colors and Files. Items are sorted automatically, colors get a swatch with HEX/RGB/HSL values, and JSON is shown formatted.
+- **Where and when.** Every item shows the app it was copied from and how long ago ("Safari · 5 mins ago"). You can search by app name too.
 - **Text inside images.** Screenshots are scanned with Apple's on-device text recognition, so you can search for words in them and paste their text.
 - **Pins.** Keep snippets you use all the time at the top, no matter how much you copy.
 - **Plain-text paste.** Hold ⇧ to paste without formatting.
@@ -59,6 +61,7 @@ Without it, CarbonCC still copies the item; you just press ⌘V yourself.
 | ↩ | Paste |
 | ⇧↩ | Paste as plain text |
 | ⌘1 … ⌘0 | Paste item 1–10 |
+| ⇥ / ⇧⇥ | Next / previous category |
 | ⌘T | Transform and paste |
 | ⌘P | Pin / unpin |
 | ⌘⌫ | Delete item |

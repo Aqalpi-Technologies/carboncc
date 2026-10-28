@@ -368,6 +368,8 @@ struct ClipItem: Codable, Identifiable, Equatable {
     var hash: String              // used to detect duplicates
     var pinned = false
     var date = Date()
+    var sourceApp: String? = nil      // e.g. "Safari" — the app that was frontmost when copied
+    var sourceBundleID: String? = nil
 
     var displayText: String {
         switch kind {
@@ -411,6 +413,229 @@ struct ClipItem: Codable, Identifiable, Equatable {
         text.localizedCaseInsensitiveContains(q)
             || displayText.localizedCaseInsensitiveContains(q)
             || (ocrText?.localizedCaseInsensitiveContains(q) ?? false)
+            || (sourceApp?.localizedCaseInsensitiveContains(q) ?? false)
+    }
+}
+
+/// "just now", "5 mins ago", "2 hours ago", "yesterday", "3 days ago", "12 Oct"
+func relativeTime(_ date: Date, now: Date = Date()) -> String {
+    let s = max(0, now.timeIntervalSince(date))
+    func plural(_ n: Int, _ unit: String) -> String { "\(n) \(unit)\(n == 1 ? "" : "s") ago" }
+    switch s {
+    case ..<60:        return "just now"
+    case ..<3600:      return plural(Int(s / 60), "min")
+    case ..<86_400:    return plural(Int(s / 3600), "hour")
+    case ..<172_800:   return "yesterday"
+    case ..<604_800:   return plural(Int(s / 86_400), "day")
+    default:
+        let f = DateFormatter()
+        let sameYear = Calendar.current.isDate(date, equalTo: now, toGranularity: .year)
+        f.dateFormat = sameYear ? "d MMM" : "d MMM yyyy"
+        return f.string(from: date)
+    }
+}
+
+// MARK: - Categories
+
+enum ClipCategory: String, CaseIterable, Identifiable {
+    case all, pinned, text, images, links, code, json, colors, files
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .all: return "All"
+        case .pinned: return "Pinned"
+        case .text: return "Text"
+        case .images: return "Images"
+        case .links: return "Links"
+        case .code: return "Code"
+        case .json: return "JSON"
+        case .colors: return "Colors"
+        case .files: return "Files"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .all: return "tray.full"
+        case .pinned: return "pin"
+        case .text: return "text.alignleft"
+        case .images: return "photo"
+        case .links: return "link"
+        case .code: return "chevron.left.forwardslash.chevron.right"
+        case .json: return "curlybraces"
+        case .colors: return "paintpalette"
+        case .files: return "doc"
+        }
+    }
+}
+
+/// A color written as #hex, rgb()/rgba() or hsl()/hsla().
+struct ColorValue {
+    let r: Double, g: Double, b: Double, a: Double   // 0…1
+
+    var nsColor: NSColor { NSColor(srgbRed: r, green: g, blue: b, alpha: a) }
+    var color: Color { Color(nsColor: nsColor) }
+
+    var hex: String {
+        let base = String(format: "#%02X%02X%02X", Int(round(r * 255)), Int(round(g * 255)), Int(round(b * 255)))
+        return a < 1 ? base + String(format: "%02X", Int(round(a * 255))) : base
+    }
+
+    var rgb: String {
+        let (R, G, B) = (Int(round(r * 255)), Int(round(g * 255)), Int(round(b * 255)))
+        return a < 1 ? "rgba(\(R), \(G), \(B), \(String(format: "%.2g", a)))" : "rgb(\(R), \(G), \(B))"
+    }
+
+    var hsl: String {
+        let mx = max(r, g, b), mn = min(r, g, b)
+        let l = (mx + mn) / 2
+        var h = 0.0, s = 0.0
+        if mx != mn {
+            let d = mx - mn
+            s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn)
+            switch mx {
+            case r: h = (g - b) / d + (g < b ? 6 : 0)
+            case g: h = (b - r) / d + 2
+            default: h = (r - g) / d + 4
+            }
+            h /= 6
+        }
+        return "hsl(\(Int(round(h * 360))), \(Int(round(s * 100)))%, \(Int(round(l * 100)))%)"
+    }
+
+    static func parse(_ raw: String) -> ColorValue? {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !t.isEmpty, t.count <= 48 else { return nil }
+
+        if t.hasPrefix("#") {
+            var hex = String(t.dropFirst())
+            guard [3, 4, 6, 8].contains(hex.count), hex.allSatisfy(\.isHexDigit) else { return nil }
+            if hex.count <= 4 { hex = hex.map { "\($0)\($0)" }.joined() }
+            guard let v = UInt64(hex, radix: 16) else { return nil }
+            if hex.count == 6 {
+                return ColorValue(r: Double((v >> 16) & 0xFF) / 255, g: Double((v >> 8) & 0xFF) / 255,
+                                  b: Double(v & 0xFF) / 255, a: 1)
+            }
+            return ColorValue(r: Double((v >> 24) & 0xFF) / 255, g: Double((v >> 16) & 0xFF) / 255,
+                              b: Double((v >> 8) & 0xFF) / 255, a: Double(v & 0xFF) / 255)
+        }
+
+        func args(_ prefix: String) -> [String]? {
+            guard t.hasPrefix(prefix), t.hasSuffix(")"),
+                  let open = t.firstIndex(of: "(") else { return nil }
+            let inner = t[t.index(after: open)..<t.index(before: t.endIndex)]
+            let parts = inner.split { $0 == "," || $0 == " " || $0 == "/" }.map(String.init)
+            return (3...4).contains(parts.count) ? parts : nil
+        }
+        func num(_ s: String, scale: Double) -> Double? {
+            if s.hasSuffix("%") { return Double(s.dropLast()).map { $0 / 100 } }
+            return Double(s).map { $0 / scale }
+        }
+        func alpha(_ p: [String]) -> Double? { p.count == 4 ? num(p[3], scale: 1) : 1 }
+
+        if let p = args("rgb") {
+            guard let r = num(p[0], scale: 255), let g = num(p[1], scale: 255),
+                  let b = num(p[2], scale: 255), let a = alpha(p),
+                  [r, g, b, a].allSatisfy({ (0...1).contains($0) }) else { return nil }
+            return ColorValue(r: r, g: g, b: b, a: a)
+        }
+        if let p = args("hsl") {
+            guard let h = Double(p[0].replacingOccurrences(of: "deg", with: "")),
+                  let s = num(p[1], scale: 100), let l = num(p[2], scale: 100), let a = alpha(p),
+                  [s, l, a].allSatisfy({ (0...1).contains($0) }) else { return nil }
+            let c = (1 - abs(2 * l - 1)) * s
+            let hh = (h.truncatingRemainder(dividingBy: 360) + 360).truncatingRemainder(dividingBy: 360) / 60
+            let x = c * (1 - abs(hh.truncatingRemainder(dividingBy: 2) - 1))
+            let (r1, g1, b1): (Double, Double, Double)
+            switch hh {
+            case ..<1: (r1, g1, b1) = (c, x, 0)
+            case ..<2: (r1, g1, b1) = (x, c, 0)
+            case ..<3: (r1, g1, b1) = (0, c, x)
+            case ..<4: (r1, g1, b1) = (0, x, c)
+            case ..<5: (r1, g1, b1) = (x, 0, c)
+            default:   (r1, g1, b1) = (c, 0, x)
+            }
+            let m = l - c / 2
+            return ColorValue(r: r1 + m, g: g1 + m, b: b1 + m, a: a)
+        }
+        return nil
+    }
+}
+
+/// Decides which category a copied item belongs to.
+enum Classifier {
+    static func category(of item: ClipItem) -> ClipCategory {
+        switch item.kind {
+        case .image: return .images
+        case .files: return .files
+        case .text:  break
+        }
+        let t = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ColorValue.parse(t) != nil { return .colors }
+        if isLink(t) { return .links }
+        if isJSON(t) { return .json }
+        if isCode(t, bundleID: item.sourceBundleID) { return .code }
+        return .text
+    }
+
+    static func url(from t: String) -> URL? {
+        let s = t.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.count < 4000, !s.contains(where: { $0.isWhitespace }) else { return nil }
+        if let u = URL(string: s), let scheme = u.scheme?.lowercased() {
+            if ["http", "https", "ftp"].contains(scheme), u.host != nil { return u }
+            if scheme == "mailto" { return u }
+            return nil
+        }
+        if s.lowercased().hasPrefix("www."), s.dropFirst(4).contains(".") {
+            return URL(string: "https://" + s)
+        }
+        return nil
+    }
+
+    static func isLink(_ t: String) -> Bool { url(from: t) != nil }
+
+    static func isJSON(_ t: String) -> Bool {
+        guard let f = t.first, f == "{" || f == "[", t.utf8.count < 2_000_000,
+              let d = t.data(using: .utf8) else { return false }
+        return (try? JSONSerialization.jsonObject(with: d)) != nil
+    }
+
+    // Apps where copied text is very likely code.
+    private static let codeApps = [
+        "com.apple.dt.Xcode", "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", // Cursor
+        "dev.zed.Zed", "com.sublimetext", "com.jetbrains.", "com.google.android.studio",
+        "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.", "com.mitchellh.ghostty",
+        "com.github.GitHubClient", "com.panic.Nova", "com.barebones.bbedit",
+    ]
+
+    private static func rx(_ p: String, _ opts: NSRegularExpression.Options = [.anchorsMatchLines]) -> NSRegularExpression {
+        try! NSRegularExpression(pattern: p, options: opts)
+    }
+
+    // (pattern, weight)
+    private static let signals: [(NSRegularExpression, Int)] = [
+        (rx(#"^\s*(import\s+[\w.{]|from\s+\S+\s+import|#include\s*[<"]|package\s+[\w.]+;?$|using\s+[\w.]+;)"#), 3),
+        (rx(#"^\s*(\$\s+)?(sudo|git|npm|npx|yarn|pnpm|brew|pip3?|cd|ls|curl|wget|docker|kubectl|ssh|scp|chmod|chown|mkdir|rm|mv|cp|xcrun|cargo|tar|grep)\s+\S"#), 3),
+        (rx(#"^\s*(SELECT\s+[\w*,.\s]+\s+FROM\s+\w|INSERT\s+INTO\s+\w|UPDATE\s+\w+\s+SET\s|DELETE\s+FROM\s+\w|CREATE\s+(TABLE|INDEX|VIEW)\s+\w)"#), 3),
+        (rx(#"\b(func|function|def|class|struct|enum|interface|const|let|var|return|public|private|static|async|await|elif|lambda|impl|fn)\b"#), 1),
+        (rx(#"(=>|->|::|&&|\|\||===|!==|\+=|-=|==|!=)"#), 1),
+        (rx(#"[;{}]\s*$"#), 1),
+        (rx(#"\w+\([^()\n]*\)\s*[{;:]?\s*$"#), 1),
+        (rx(#"</?[a-zA-Z][\w-]*(\s+[\w-]+(="[^"]*")?)*\s*/?>"#), 2),
+        (rx(#"^\s*(//|/\*|\*\s|#!)"#), 1),
+        (rx(#"^( {2,}|\t)\S"#), 1),
+    ]
+
+    static func isCode(_ t: String, bundleID: String?) -> Bool {
+        let sample = String(t.prefix(5000))
+        let range = NSRange(sample.startIndex..., in: sample)
+        var score = 0
+        if let b = bundleID, codeApps.contains(where: { b.hasPrefix($0) }) { score += 2 }
+        for (re, weight) in signals where re.firstMatch(in: sample, range: range) != nil {
+            score += weight
+        }
+        return score >= 3
     }
 }
 
@@ -497,7 +722,12 @@ final class ClipboardStore: ObservableObject {
 
         let types = Set((pb.types ?? []).map(\.rawValue))
         guard types.isDisjoint(with: ignoredTypes) else { return }
-        guard let captured = capture(pb) else { return }
+        guard var captured = capture(pb) else { return }
+        // The app in front when the copy happened is (almost always) where it came from.
+        if let front = NSWorkspace.shared.frontmostApplication {
+            captured.item.sourceApp = front.localizedName
+            captured.item.sourceBundleID = front.bundleIdentifier
+        }
         insert(captured.item, png: captured.png)
     }
 
@@ -542,6 +772,8 @@ final class ClipboardStore: ObservableObject {
             if items[i].pinned { return } // already pinned, leave it where it is
             var existing = items.remove(at: i)
             existing.date = Date()
+            existing.sourceApp = newItem.sourceApp
+            existing.sourceBundleID = newItem.sourceBundleID
             if newItem.kind == .text {
                 existing.rtf = newItem.rtf
                 existing.html = newItem.html
@@ -732,6 +964,37 @@ final class ClipboardStore: ObservableObject {
         icon.size = NSSize(width: size, height: size)
         return icon
     }
+
+    // MARK: Categories & source apps
+
+    private var categoryCache: [UUID: ClipCategory] = [:]
+    private let appIcons = NSCache<NSString, NSImage>()
+
+    func category(of item: ClipItem) -> ClipCategory {
+        if let c = categoryCache[item.id] { return c }
+        let c = Classifier.category(of: item)
+        categoryCache[item.id] = c
+        return c
+    }
+
+    func counts() -> [ClipCategory: Int] {
+        var out: [ClipCategory: Int] = [.all: items.count, .pinned: 0]
+        for item in items {
+            if item.pinned { out[.pinned, default: 0] += 1 }
+            out[category(of: item), default: 0] += 1
+        }
+        return out
+    }
+
+    func appIcon(bundleID: String?) -> NSImage? {
+        guard let bundleID else { return nil }
+        if let cached = appIcons.object(forKey: bundleID as NSString) { return cached }
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else { return nil }
+        let icon = NSWorkspace.shared.icon(forFile: url.path).copy() as! NSImage
+        icon.size = NSSize(width: 32, height: 32)
+        appIcons.setObject(icon, forKey: bundleID as NSString)
+        return icon
+    }
 }
 
 // MARK: - Simulated ⌘V
@@ -802,6 +1065,7 @@ final class GlobalHotKey {
 
 final class PanelModel: ObservableObject {
     @Published var query = "" { didSet { if oldValue != query { selection = 0 } } }
+    @Published var category: ClipCategory = .all { didSet { if oldValue != category { selection = 0 } } }
     @Published var selection = 0
     @Published var focusToken = 0
     @Published var busy = false
@@ -810,10 +1074,21 @@ final class PanelModel: ObservableObject {
 
     var results: [ClipItem] {
         let store = ClipboardStore.shared
-        let all = store.pinned + store.history
+        var list: [ClipItem]
+        switch category {
+        case .all:    list = store.pinned + store.history
+        case .pinned: list = store.pinned
+        default:      list = (store.pinned + store.history).filter { store.category(of: $0) == category }
+        }
         let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return all }
-        return all.filter { $0.matches(q) }
+        if !q.isEmpty { list = list.filter { $0.matches(q) } }
+        return list
+    }
+
+    func cycleCategory(_ step: Int) {
+        let all = ClipCategory.allCases
+        let i = all.firstIndex(of: category) ?? 0
+        category = all[(i + step + all.count) % all.count]
     }
 }
 
@@ -847,8 +1122,55 @@ struct TransformMenuItems: View {
     }
 }
 
+/// "Safari · 5 mins ago", with the app's icon. Updates itself every 30 seconds.
+struct SourceAndTime: View {
+    let item: ClipItem
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if let app = item.sourceApp {
+                if let icon = ClipboardStore.shared.appIcon(bundleID: item.sourceBundleID) {
+                    Image(nsImage: icon).resizable().frame(width: 12, height: 12)
+                }
+                Text(app)
+                Text("·")
+            }
+            TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                Text(relativeTime(item.date, now: ctx.date))
+            }
+        }
+    }
+}
+
+/// The small picture at the start of each row.
+struct ItemIcon: View {
+    let item: ClipItem
+    let category: ClipCategory
+    var size: CGFloat = 26
+
+    var body: some View {
+        Group {
+            if category == .colors, let c = ColorValue.parse(item.text) {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(c.color)
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.primary.opacity(0.15)))
+                    .padding(2)
+            } else if let thumb = ClipboardStore.shared.thumbnail(for: item, size: size * 2) {
+                Image(nsImage: thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .cornerRadius(3)
+            } else {
+                Image(systemName: category.symbol).foregroundColor(.secondary)
+            }
+        }
+        .frame(width: size, height: size)
+    }
+}
+
 struct ClipRow: View {
     let item: ClipItem
+    let category: ClipCategory
     let index: Int
     let selected: Bool
     let accent: Color
@@ -860,29 +1182,19 @@ struct ClipRow: View {
                 .foregroundColor(.secondary)
                 .frame(width: 24, alignment: .leading)
 
-            Group {
-                if let thumb = ClipboardStore.shared.thumbnail(for: item, size: 56) {
-                    Image(nsImage: thumb)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .cornerRadius(3)
-                } else {
-                    Image(systemName: "text.alignleft").foregroundColor(.secondary)
-                }
-            }
-            .frame(width: 26, height: 26)
+            ItemIcon(item: item, category: category)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(previewText(item.displayText, limit: 80))
                     .lineLimit(1)
                     .truncationMode(.tail)
-                HStack(spacing: 5) {
+                HStack(spacing: 4) {
                     if item.pinned {
                         Image(systemName: "pin.fill").foregroundColor(accent)
                     }
-                    Text(item.kindLabel)
+                    Text(category.label)
                     Text("·")
-                    Text(item.date, style: .relative) + Text(" ago")
+                    SourceAndTime(item: item)
                 }
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -897,8 +1209,45 @@ struct ClipRow: View {
     }
 }
 
+/// The row of category tabs under the search field.
+struct CategoryBar: View {
+    @ObservedObject var model: PanelModel
+    let counts: [ClipCategory: Int]
+    let accent: Color
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(ClipCategory.allCases) { cat in
+                    let count = counts[cat] ?? 0
+                    let selected = model.category == cat
+                    Button {
+                        model.category = cat
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: cat.symbol)
+                            Text(cat.label)
+                            Text("\(count)")
+                                .foregroundColor(selected ? Color.white.opacity(0.85) : Color.secondary)
+                        }
+                        .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(selected ? accent : Color.primary.opacity(0.06)))
+                        .foregroundColor(selected ? Color.white : (count == 0 ? Color.secondary : Color.primary))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+        }
+        .padding(.vertical, 8)
+    }
+}
+
 struct PreviewPane: View {
     let item: ClipItem?
+    let category: ClipCategory
     @ObservedObject var model: PanelModel
     private let maxChars = 20_000
 
@@ -912,6 +1261,10 @@ struct PreviewPane: View {
                 }
                 Divider()
                 HStack(spacing: 8) {
+                    SourceAndTime(item: item)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text("·").font(.caption).foregroundColor(.secondary)
                     Text(item.details)
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -939,13 +1292,15 @@ struct PreviewPane: View {
         s.count > maxChars ? String(s.prefix(maxChars)) + "\n\n… (preview truncated)" : s
     }
 
+    private func label(_ s: String) -> some View {
+        Text(s).font(.caption2.bold()).foregroundColor(.secondary)
+    }
+
     @ViewBuilder
     private func content(_ item: ClipItem) -> some View {
         switch item.kind {
         case .text:
-            Text(limited(item.text))
-                .font(.system(size: 12, design: .monospaced))
-                .textSelection(.enabled)
+            textContent(item)
 
         case .image:
             VStack(alignment: .leading, spacing: 12) {
@@ -966,9 +1321,7 @@ struct PreviewPane: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                 case let t?:
-                    Text("TEXT IN IMAGE")
-                        .font(.caption2.bold())
-                        .foregroundColor(.secondary)
+                    label("TEXT IN IMAGE")
                     Text(limited(t))
                         .font(.system(size: 12, design: .monospaced))
                         .textSelection(.enabled)
@@ -992,6 +1345,65 @@ struct PreviewPane: View {
             }
         }
     }
+
+    @ViewBuilder
+    private func textContent(_ item: ClipItem) -> some View {
+        switch category {
+        case .colors:
+            if let c = ColorValue.parse(item.text) {
+                VStack(alignment: .leading, spacing: 14) {
+                    RoundedRectangle(cornerRadius: 10)
+                        .fill(c.color)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.15)))
+                        .frame(height: 140)
+                    Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
+                        GridRow { label("HEX"); Text(c.hex) }
+                        GridRow { label("RGB"); Text(c.rgb) }
+                        GridRow { label("HSL"); Text(c.hsl) }
+                    }
+                    .font(.system(size: 13, design: .monospaced))
+                    .textSelection(.enabled)
+                    Text("Tip: right-click → Transform & Paste works on the text as copied.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+        case .links:
+            VStack(alignment: .leading, spacing: 10) {
+                if let url = Classifier.url(from: item.text) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "link")
+                        Text(url.host ?? url.absoluteString).font(.headline)
+                    }
+                    Text(limited(item.text))
+                        .font(.system(size: 12, design: .monospaced))
+                        .textSelection(.enabled)
+                    Button("Open in Browser") { NSWorkspace.shared.open(url) }
+                }
+            }
+
+        case .json:
+            VStack(alignment: .leading, spacing: 8) {
+                label("JSON (FORMATTED)")
+                Text(limited(item.text.count < 200_000
+                             ? (JSONFormatter.format(item.text, pretty: true) ?? item.text)
+                             : item.text))
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+
+        case .code:
+            Text(limited(item.text))
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+
+        default:
+            Text(limited(item.text))
+                .font(.system(size: 13))
+                .textSelection(.enabled)
+        }
+    }
 }
 
 struct PanelView: View {
@@ -1007,30 +1419,36 @@ struct PanelView: View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                TextField("Search clipboard (text inside images too)…", text: $model.query)
+                TextField("Search clipboard, text inside images, or app name…", text: $model.query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 16))
                     .focused($searchFocused)
             }
-            .padding(14)
+            .padding(.horizontal, 14)
+            .padding(.top, 14)
+            .padding(.bottom, 4)
+
+            CategoryBar(model: model, counts: store.counts(), accent: settings.accentColor)
 
             Divider()
 
             HStack(spacing: 0) {
                 list(results)
-                    .frame(width: 340)
+                    .frame(width: 360)
                 Divider()
-                PreviewPane(item: selected, model: model)
+                PreviewPane(item: selected,
+                            category: selected.map { store.category(of: $0) } ?? .text,
+                            model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
             Divider()
-            Text("↩ paste   ⇧↩ plain text   ⌘1–0 quick paste   ⌘T transform   ⌘P pin   ⌘⌫ delete   esc close")
+            Text("↩ paste   ⇧↩ plain text   ⌘1–0 quick paste   ⇥ next category   ⌘T transform   ⌘P pin   ⌘⌫ delete   esc close")
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .padding(.vertical, 8)
         }
-        .frame(width: 820, height: 500)
+        .frame(width: 880, height: 560)
         .background(VisualEffect())
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .onReceive(model.$focusToken) { _ in
@@ -1043,7 +1461,9 @@ struct PanelView: View {
         if results.isEmpty {
             VStack {
                 Spacer()
-                Text(model.query.isEmpty ? "Nothing copied yet" : "No matches")
+                Text(model.query.isEmpty
+                     ? (model.category == .all ? "Nothing copied yet" : "Nothing in \(model.category.label) yet")
+                     : "No matches")
                     .foregroundColor(.secondary)
                 Spacer()
             }
@@ -1053,7 +1473,9 @@ struct PanelView: View {
                 ScrollView {
                     LazyVStack(spacing: 2) {
                         ForEach(Array(results.enumerated()), id: \.element.id) { idx, item in
-                            ClipRow(item: item, index: idx,
+                            ClipRow(item: item,
+                                    category: store.category(of: item),
+                                    index: idx,
                                     selected: idx == model.selection,
                                     accent: settings.accentColor)
                                 .id(item.id)
@@ -1103,7 +1525,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         model.choose = { [weak self] item, plain in self?.choose(item, plain: plain) }
         model.transform = { [weak self] item, t in self?.transform(item, t) }
 
-        let p = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 820, height: 500),
+        let p = SearchPanel(contentRect: NSRect(x: 0, y: 0, width: 880, height: 560),
                             styleMask: [.nonactivatingPanel, .borderless],
                             backing: .buffered, defer: false)
         p.isOpaque = false
@@ -1123,6 +1545,7 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     func show() {
         model.query = ""
+        model.category = .all
         model.selection = 0
         model.busy = false
         position()
@@ -1183,20 +1606,17 @@ final class PanelController: NSObject, NSWindowDelegate {
         }
         let y: CGFloat = view.isFlipped ? 70 : view.bounds.height - 70
         menuOpen = true
-        menu.popUp(positioning: menu.items.first, at: NSPoint(x: 360, y: y), in: view)
+        menu.popUp(positioning: menu.items.first, at: NSPoint(x: 380, y: y), in: view)
         menuOpen = false
     }
 
+    /// Centers the panel on the screen you're working on (the one with the mouse).
     private func position() {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) } ?? NSScreen.main
+        guard let vf = screen?.visibleFrame else { panel.center(); return }
         let size = panel.frame.size
-        var origin = NSPoint(x: mouse.x - 40, y: mouse.y - size.height - 12)
-        if let vf = screen?.visibleFrame {
-            origin.x = min(max(origin.x, vf.minX + 8), vf.maxX - size.width - 8)
-            origin.y = min(max(origin.y, vf.minY + 8), vf.maxY - size.height - 8)
-        }
-        panel.setFrameOrigin(origin)
+        panel.setFrameOrigin(NSPoint(x: vf.midX - size.width / 2, y: vf.midY - size.height / 2))
     }
 
     private func handle(_ e: NSEvent) -> NSEvent? {
@@ -1218,6 +1638,9 @@ final class PanelController: NSObject, NSWindowDelegate {
             return nil
         case kVK_Return, kVK_ANSI_KeypadEnter:
             if hasSelection { choose(results[model.selection], plain: plainDefault != shift) }
+            return nil
+        case kVK_Tab:
+            model.cycleCategory(shift ? -1 : 1)
             return nil
         default:
             break
@@ -1498,7 +1921,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mi.representedObject = item.id
         mi.attributedTitle = menuTitle(for: item, number: number)
         let tip = item.kind == .image ? (item.ocrText.flatMap { $0.isEmpty ? nil : $0 } ?? item.text) : item.text
-        mi.toolTip = String(tip.prefix(600))
+        let origin = [item.sourceApp, relativeTime(item.date)].compactMap { $0 }.joined(separator: " · ")
+        mi.toolTip = origin + "\n\n" + String(tip.prefix(600))
         mi.image = store.thumbnail(for: item, size: item.kind == .image ? 28 : 16)
         // Items 1–10 get number keys: open the menu and press 1…9, 0
         if let n = number, n <= 10 {
