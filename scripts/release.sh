@@ -15,8 +15,11 @@ export VERSION
 APP="build/CarbonCC.app"
 ZIP="build/CarbonCC-$VERSION.zip"
 
-IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning \
-  | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)}"
+IDENTITY="${SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+  IDENTITY="$(security find-identity -v -p codesigning \
+    | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)"
+fi
 if [ -z "$IDENTITY" ]; then
   echo "✗ No \"Developer ID Application\" certificate found in the keychain." >&2
   exit 1

@@ -17,11 +17,14 @@ KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
 scripts/build.sh
 
-IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning \
-  | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)}"
+IDENTITY="${SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+  IDENTITY="$(security find-identity -v -p codesigning \
+    | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)"
+fi
 
 if [ -n "$IDENTITY" ]; then
-  echo "→ Signing with $IDENTITY…"
+  echo "→ Signing with ${IDENTITY}…"
   codesign --force --options runtime --timestamp --sign "$IDENTITY" "$APP"
 else
   if ! security find-certificate -c "$LOCAL_CERT" "$KEYCHAIN" >/dev/null 2>&1; then
