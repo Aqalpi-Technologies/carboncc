@@ -1,0 +1,9 @@
+build/
+.DS_Store
+
+# Never commit signing material
+*.p12
+*.p8
+*.cer
+*.mobileprovision
+AuthKey_*
